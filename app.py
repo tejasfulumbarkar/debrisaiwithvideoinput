@@ -317,6 +317,222 @@ with col2:
     )
     uploaded_file = st.file_uploader("", type=["jpg", "jpeg", "png", "mp4", "avi"])
 
+# Add DebrisTracker class
+class DebrisTracker:
+    def __init__(self, id, initial_pos):
+        self.id = id
+        self.kalman = cv2.KalmanFilter(4, 2)
+        self.kalman.transitionMatrix = np.array([[1, 0, 1, 0],
+                                                 [0, 1, 0, 1],
+                                                 [0, 0, 1, 0],
+                                                 [0, 0, 0, 1]], np.float32)
+        self.kalman.measurementMatrix = np.array([[1, 0, 0, 0],
+                                                  [0, 1, 0, 0]], np.float32)
+        self.kalman.processNoiseCov = np.eye(4, dtype=np.float32) * 1e-2
+        self.kalman.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1e-1
+        self.kalman.errorCovPost = np.eye(4, dtype=np.float32)
+        self.kalman.statePost = np.array([[initial_pos[0]],
+                                          [initial_pos[1]],
+                                          [0],
+                                          [0]], np.float32)
+        self.last_position = initial_pos
+        self.skipped_frames = 0
+        self.trajectory = []
+        self.color = (238, 130, 238)
+
+    def predict(self):
+        prediction = self.kalman.predict()
+        pred_pos = (int(prediction[0][0]), int(prediction[1][0]))
+        self.trajectory.append(pred_pos)
+        return pred_pos
+
+    def update(self, measurement):
+        msr = np.array([[np.float32(measurement[0])],
+                        [np.float32(measurement[1])]])
+        self.kalman.correct(msr)
+        self.last_position = measurement
+        self.skipped_frames = 0
+
+    def get_state(self):
+        state = self.kalman.statePost.flatten()
+        return state
+
+    def compute_priority(self, removal_position):
+        state = self.get_state()
+        pos = np.array([state[0], state[1]])
+        vel = np.array([state[2], state[3]])
+        d = pos - removal_position
+        v_norm_sq = np.dot(vel, vel)
+        if v_norm_sq == 0:
+            return float('inf'), pos, np.linalg.norm(d)
+        t_closest = - np.dot(d, vel) / v_norm_sq
+        t_closest = max(t_closest, 0)
+        predicted_pos = pos + vel * t_closest
+        min_distance = np.linalg.norm(predicted_pos - removal_position)
+        priority = t_closest
+        return priority, predicted_pos, min_distance
+
+def predict_trajectory(video_path):
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        st.error("Error: Cannot open video source.")
+        return None
+
+    backSub = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=25, detectShadows=False)
+    trackers = {}
+    next_track_id = 1
+    max_skipped_frames = 10
+    association_threshold = 50
+    removal_position = np.array([100, 100])
+
+    frames = []
+    frame_count = 0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Initialize progress bar and status text
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        fgMask = backSub.apply(frame)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        fgMask = cv2.morphologyEx(fgMask, cv2.MORPH_OPEN, kernel)
+        fgMask = cv2.morphologyEx(fgMask, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(fgMask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        detections = []
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = cv2.contourArea(cnt)
+            cx = x + w // 2
+            cy = y + h // 2
+
+            if area < 25:
+                continue
+
+            detections.append((cx, cy, area))
+
+        assigned_det = set()
+        for tid, tracker in trackers.items():
+            pred = tracker.predict()
+            min_dist = float('inf')
+            matched_detection = None
+            for i, detection in enumerate(detections):
+                if i in assigned_det:
+                    continue
+                cx, cy, area = detection
+                distance = np.linalg.norm(np.array(pred) - np.array([cx, cy]))
+                if distance < min_dist:
+                    min_dist = distance
+                    matched_detection = (i, detection)
+            if matched_detection is not None and min_dist < association_threshold:
+                det_index, det = matched_detection
+                tracker.update(det[:2])
+                assigned_det.add(det_index)
+                if det[2] < 50:
+                    tracker.color = (238, 130, 238)
+                elif 50 <= det[2] < 200:
+                    tracker.color = (0, 165, 255)
+                else:
+                    tracker.color = (0, 255, 0)
+            else:
+                tracker.skipped_frames += 1
+
+        for i, detection in enumerate(detections):
+            if i not in assigned_det:
+                cx, cy, area = detection
+                trackers[next_track_id] = DebrisTracker(next_track_id, (cx, cy))
+                if area < 50:
+                    trackers[next_track_id].color = (238, 130, 238)
+                elif 50 <= area < 200:
+                    trackers[next_track_id].color = (0, 165, 255)
+                else:
+                    trackers[next_track_id].color = (0, 255, 0)
+                next_track_id += 1
+
+        del_ids = [tid for tid, trk in trackers.items() if trk.skipped_frames > max_skipped_frames]
+        for tid in del_ids:
+            del trackers[tid]
+
+        removal_info = []
+        for tid, tracker in trackers.items():
+            priority, pred_pos, min_distance = tracker.compute_priority(removal_position)
+            removal_info.append((tid, priority, pred_pos, min_distance))
+            state = tracker.get_state()
+            current_pos = (int(state[0]), int(state[1]))
+            contour = np.array([[current_pos]], dtype=np.int32)
+            area = cv2.contourArea(contour)
+
+            cv2.circle(frame, current_pos, 5, tracker.color, -1)
+            cv2.putText(frame, f"ID:{tid}", (current_pos[0] + 5, current_pos[1]),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, tracker.color, 2)
+
+            for j in range(1, len(tracker.trajectory)):
+                cv2.line(frame, tracker.trajectory[j - 1], tracker.trajectory[j], tracker.color, 2)
+
+        removal_asset_pt = (int(removal_position[0]), int(removal_position[1]))
+        cv2.circle(frame, removal_asset_pt, 8, (0, 0, 255), -1)
+        cv2.putText(frame, "Removal Asset", (removal_asset_pt[0] + 10, removal_asset_pt[1]),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        frames.append(frame)
+        
+        # Update progress
+        frame_count += 1
+        progress = frame_count / total_frames
+        progress_bar.progress(progress)
+        status_text.markdown(f"<p style='color: white; margin: 0; padding: 0;'>Processing frame {frame_count}/{total_frames}</p>", unsafe_allow_html=True)
+
+    cap.release()
+    
+    # Save frames as video
+    if frames:
+        # Try different codecs
+        codecs = [
+            ('avc1', '.mp4'),
+            ('H264', '.mp4'),
+            ('XVID', '.avi'),
+            ('MJPG', '.avi'),
+            ('mp4v', '.mp4')
+        ]
+        
+        output_path = None
+        for codec, ext in codecs:
+            try:
+                temp_output = os.path.join('temp_videos', f'trajectory_output{ext}')
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                out = cv2.VideoWriter(temp_output, fourcc, 30, 
+                                    (frames[0].shape[1], frames[0].shape[0]))
+                
+                for frame in frames:
+                    out.write(frame)
+                
+                out.release()
+                
+                # Check if the file was created and is not empty
+                if os.path.exists(temp_output) and os.path.getsize(temp_output) > 0:
+                    output_path = temp_output
+                    break
+            except Exception as e:
+                continue
+        
+        # Save removal order
+        with open("removal_order.txt", "w") as f:
+            removal_info_sorted = sorted(removal_info, key=lambda x: x[1])
+            f.write("Removal Order:\n")
+            for i, info in enumerate(removal_info_sorted):
+                tid, priority, pred_int, min_distance = info
+                text = f"{i+1}: ID {tid}, t_closest: {priority:.2f}, d: {min_distance:.1f}\n"
+                f.write(text)
+        
+        return output_path, removal_info_sorted
+    
+    return None, None
+
 def calculate_debris_size(width, height):
     area = width * height
     if area < 1000:
@@ -627,65 +843,102 @@ if uploaded_file is not None:
     file_extension = uploaded_file.name.split('.')[-1].lower()
     
     if file_extension in ['mp4', 'avi']:
-        # Process video
-        st.markdown("<p style='color: white;'>Processing video... This may take a few minutes depending on the video length.</p>", unsafe_allow_html=True)
+        # Add buttons for different processing options
+        col1, col2 = st.columns(2)
         
-        try:
-            # Process the video
-            video_results = process_video(temp_file.name)
-            
-            # Display results
-            if video_results['total_detections'] > 0:  # Changed from debris_count to total_detections
-                st.success(f"Video processing complete! Detected approximately {video_results['debris_count']} unique debris objects across all frames.")
-                st.info(f"Total detection events: {video_results['total_detections']} (includes multiple detections of the same debris)")
-            else:
-                st.warning("No debris detected in the video.")
-            
-            # Try different methods to display the video
-            try:
-                # Method 1: Direct file path
-                st.video(video_results['output_path'])
-            except Exception as e1:
+        with col1:
+            if st.button("Process Video with YOLO"):
+                # Process video with YOLO
+                st.markdown("<p style='color: white;'>Processing video... This may take a few minutes depending on the video length.</p>", unsafe_allow_html=True)
+                
                 try:
-                    # Method 2: Read as bytes
-                    with open(video_results['output_path'], 'rb') as video_file:
-                        video_bytes = video_file.read()
-                        st.video(video_bytes)
-                except Exception as e2:
-                    try:
-                        # Method 3: Read as bytes with explicit format
-                        with open(video_results['output_path'], 'rb') as video_file:
-                            video_bytes = video_file.read()
-                            st.video(video_bytes, format='video/mp4')
-                    except Exception as e3:
-                        st.error("Unable to display the video. Please try a different video file.")
-                        st.error(f"Error details: {str(e3)}")
-            
-            # Display statistics
-            st.markdown(
-                f"""
-                <div class='result-box'>
-                    <h3 style='color: #E2A3FF; margin-bottom: 1rem;'>Analysis Results</h3>
-                    <p style='margin-bottom: 0.5rem;'>🎥 <strong>Video Length:</strong> {int(video_results['total_frames'] / video_results['fps'])} seconds</p>
-                    <p style='margin-bottom: 0.5rem;'>📊 <strong>Total Frames:</strong> {video_results['total_frames']}</p>
-                    <p style='margin-bottom: 0.5rem;'>🔍 <strong>Total Debris Detections:</strong> {video_results['total_detections']}</p>
-                    <p style='margin-bottom: 0.5rem;'>🎯 <strong>Frames with Debris:</strong> {video_results['debris_count']}</p>
-                    <p style='margin-bottom: 0.5rem;'>📈 <strong>Average Detections per Frame:</strong> {video_results['total_detections']/video_results['total_frames']:.2f}</p>
-                    <p style='margin-bottom: 0.5rem;'>📐 <strong>Resolution:</strong> {video_results['width']}x{video_results['height']}</p>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-            
-            # Display detection details if any were found
-            if video_results['detection_details']:
-                st.markdown("### Detection Details")
-                for det in video_results['detection_details']:
-                    st.markdown(f"- Frame {det['frame']}: Confidence {det['confidence']:.2f}")
+                    # Process the video
+                    video_results = process_video(temp_file.name)
                     
-        except Exception as e:
-            st.error(f"Error processing video: {str(e)}")
-            st.info("Please make sure the video format is supported and try again.")
+                    # Display results
+                    if video_results['total_detections'] > 0:
+                        st.success(f"Video processing complete! Detected approximately {video_results['debris_count']} unique debris objects across all frames.")
+                        st.info(f"Total detection events: {video_results['total_detections']} (includes multiple detections of the same debris)")
+                    else:
+                        st.warning("No debris detected in the video.")
+                    
+                    # Try different methods to display the video
+                    try:
+                        # Method 1: Direct file path
+                        st.video(video_results['output_path'])
+                    except Exception as e1:
+                        try:
+                            # Method 2: Read as bytes
+                            with open(video_results['output_path'], 'rb') as video_file:
+                                video_bytes = video_file.read()
+                                st.video(video_bytes)
+                        except Exception as e2:
+                            try:
+                                # Method 3: Read as bytes with explicit format
+                                with open(video_results['output_path'], 'rb') as video_file:
+                                    video_bytes = video_file.read()
+                                    st.video(video_bytes, format='video/mp4')
+                            except Exception as e3:
+                                st.error("Unable to display the video. Please try a different video file.")
+                                st.error(f"Error details: {str(e3)}")
+                    
+                    # Display statistics
+                    st.markdown(
+                        f"""
+                        <div class='result-box'>
+                            <h3 style='color: #E2A3FF; margin-bottom: 1rem;'>Analysis Results</h3>
+                            <p style='margin-bottom: 0.5rem;'>🎥 <strong>Video Length:</strong> {int(video_results['total_frames'] / video_results['fps'])} seconds</p>
+                            <p style='margin-bottom: 0.5rem;'>📊 <strong>Total Frames:</strong> {video_results['total_frames']}</p>
+                            <p style='margin-bottom: 0.5rem;'>🔍 <strong>Total Debris Detections:</strong> {video_results['total_detections']}</p>
+                            <p style='margin-bottom: 0.5rem;'>🎯 <strong>Frames with Debris:</strong> {video_results['debris_count']}</p>
+                            <p style='margin-bottom: 0.5rem;'>📈 <strong>Average Detections per Frame:</strong> {video_results['total_detections']/video_results['total_frames']:.2f}</p>
+                            <p style='margin-bottom: 0.5rem;'>📐 <strong>Resolution:</strong> {video_results['width']}x{video_results['height']}</p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+                    
+                except Exception as e:
+                    st.error(f"Error processing video: {str(e)}")
+                    st.info("Please make sure the video format is supported and try again.")
+        
+        with col2:
+            if st.button("Predict Trajectories"):
+                st.markdown("<p style='color: white;'>Analyzing debris trajectories... This may take a few minutes.</p>", unsafe_allow_html=True)
+                
+                try:
+                    output_path, removal_info = predict_trajectory(temp_file.name)
+                    
+                    if output_path:
+                        st.success("Trajectory prediction complete!")
+                        
+                        # Display the video with trajectories
+                        try:
+                            with open(output_path, 'rb') as video_file:
+                                video_bytes = video_file.read()
+                                st.video(video_bytes, format='video/mp4')
+                        except Exception as e:
+                            st.error(f"Error displaying video: {str(e)}")
+                        
+                        # Display removal order
+                        if removal_info:
+                            st.markdown("### 🎯 Recommended Removal Order")
+                            for i, info in enumerate(removal_info):
+                                tid, priority, pred_pos, min_distance = info
+                                st.markdown(f"""
+                                    <div class='result-box'>
+                                        <p style='margin-bottom: 0.5rem;'>#{i+1} Debris ID: {tid}</p>
+                                        <p style='margin-bottom: 0.5rem;'>⏱️ Time to closest approach: {priority:.2f} seconds</p>
+                                        <p style='margin-bottom: 0.5rem;'>📏 Minimum distance: {min_distance:.1f} pixels</p>
+                                        <p style='margin-bottom: 0.5rem;'>📍 Predicted position: ({int(pred_pos[0])}, {int(pred_pos[1])})</p>
+                                    </div>
+                                """, unsafe_allow_html=True)
+                    else:
+                        st.error("Failed to process video for trajectory prediction.")
+                        
+                except Exception as e:
+                    st.error(f"Error during trajectory prediction: {str(e)}")
+                    st.info("Please make sure the video format is supported and try again.")
     else:
         # Process image
         # Save uploaded file
