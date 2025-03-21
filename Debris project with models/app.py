@@ -450,9 +450,12 @@ def process_video(video_path):
     fps = int(cap.get(cv2.CAP_PROP_FPS))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    # Create temporary directory using tempfile
-    temp_dir = tempfile.mkdtemp()
-    output_path = os.path.join(temp_dir, 'output.mp4')
+    # Create temporary directory if it doesn't exist
+    if not os.path.exists('temp_videos'):
+        os.makedirs('temp_videos')
+    
+    # Create output paths
+    output_path = os.path.join('temp_videos', 'output.mp4')
     
     # Initialize progress bar
     progress_bar = st.progress(0)
@@ -461,7 +464,7 @@ def process_video(video_path):
     # Store frames in memory
     frames = []
     frame_count = 0
-    total_detections = 0
+    total_detections = 0  # Rename for clarity
     detection_details = []
     
     # Define colors for different confidence levels
@@ -567,49 +570,28 @@ def process_video(video_path):
         progress_bar.progress(progress)
         status_text.text(f"Processing frame {frame_count}/{total_frames}")
     
+    # Calculate estimated unique debris
+    unique_debris = len(set(det['frame'] for det in detection_details))  # Count frames with detections
+    
     # Release the capture
     cap.release()
     
     # Save frames as video using cv2.VideoWriter
     if frames:
-        try:
-            # Use H264 codec for MP4
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H264 codec
-            out = cv2.VideoWriter(output_path, fourcc, fps, 
-                                (frames[0].shape[1], frames[0].shape[0]))
-            
-            for frame in frames:
-                out.write(frame)
-            
-            out.release()
-            
-            # Read the video file as bytes
-            with open(output_path, 'rb') as video_file:
-                video_bytes = video_file.read()
-            
-            # Clean up temporary files
-            os.remove(output_path)
-            os.rmdir(temp_dir)
-            
-            return {
-                'video_bytes': video_bytes,
-                'debris_count': len(set(det['frame'] for det in detection_details)),
-                'total_detections': total_detections,
-                'total_frames': total_frames,
-                'fps': fps,
-                'width': width,
-                'height': height,
-                'detection_details': detection_details
-            }
-            
-        except Exception as e:
-            st.error(f"Error saving video: {str(e)}")
-            # Try alternative codec if avc1 fails
+        # Try different codecs
+        codecs = [
+            ('avc1', '.mp4'),
+            ('H264', '.mp4'),
+            ('XVID', '.avi'),
+            ('MJPG', '.avi'),
+            ('mp4v', '.mp4')
+        ]
+        
+        for codec, ext in codecs:
             try:
-                # Use mp4v as fallback
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                output_path = os.path.join(temp_dir, 'output_fallback.mp4')
-                out = cv2.VideoWriter(output_path, fourcc, fps, 
+                temp_output = os.path.join('temp_videos', f'output{ext}')
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                out = cv2.VideoWriter(temp_output, fourcc, fps, 
                                     (frames[0].shape[1], frames[0].shape[0]))
                 
                 for frame in frames:
@@ -617,29 +599,24 @@ def process_video(video_path):
                 
                 out.release()
                 
-                # Read the video file as bytes
-                with open(output_path, 'rb') as video_file:
-                    video_bytes = video_file.read()
-                
-                # Clean up temporary files
-                os.remove(output_path)
-                os.rmdir(temp_dir)
-                
-                return {
-                    'video_bytes': video_bytes,
-                    'debris_count': len(set(det['frame'] for det in detection_details)),
-                    'total_detections': total_detections,
-                    'total_frames': total_frames,
-                    'fps': fps,
-                    'width': width,
-                    'height': height,
-                    'detection_details': detection_details
-                }
-            except Exception as e2:
-                st.error(f"Error with fallback codec: {str(e2)}")
-                return None
+                # Check if the file was created and is not empty
+                if os.path.exists(temp_output) and os.path.getsize(temp_output) > 0:
+                    output_path = temp_output
+                    break
+            except Exception as e:
+                continue
     
-    return None
+    # Return video properties along with output path and debris count
+    return {
+        'output_path': output_path,
+        'debris_count': unique_debris,
+        'total_detections': total_detections,
+        'total_frames': total_frames,
+        'fps': fps,
+        'width': width,
+        'height': height,
+        'detection_details': detection_details
+    }
 
 if uploaded_file is not None:
     # Create a temporary file to store the uploaded file
@@ -649,7 +626,7 @@ if uploaded_file is not None:
     
     file_extension = uploaded_file.name.split('.')[-1].lower()
     
-    if file_extension == 'mp4':  # Only accept MP4 files
+    if file_extension in ['mp4', 'avi']:
         # Process video
         st.info("Processing video... This may take a few minutes depending on the video length.")
         
@@ -657,45 +634,59 @@ if uploaded_file is not None:
             # Process the video
             video_results = process_video(temp_file.name)
             
-            if video_results:
-                # Display results
-                if video_results['total_detections'] > 0:
-                    st.success(f"Video processing complete! Detected approximately {video_results['debris_count']} unique debris objects across all frames.")
-                    st.info(f"Total detection events: {video_results['total_detections']} (includes multiple detections of the same debris)")
-                else:
-                    st.warning("No debris detected in the video.")
-                
-                # Display the processed video using video bytes
-                if 'video_bytes' in video_results:
-                    st.video(video_results['video_bytes'], format='video/mp4')
-                else:
-                    st.error("Error: Video processing completed but video data is not available.")
-                
-                # Display statistics
-                st.markdown(
-                    f"""
-                    <div class='result-box'>
-                        <h3 style='color: #E2A3FF; margin-bottom: 1rem;'>Analysis Results</h3>
-                        <p style='margin-bottom: 0.5rem;'>🎥 <strong>Video Length:</strong> {int(video_results['total_frames'] / video_results['fps'])} seconds</p>
-                        <p style='margin-bottom: 0.5rem;'>📊 <strong>Total Frames:</strong> {video_results['total_frames']}</p>
-                        <p style='margin-bottom: 0.5rem;'>🔍 <strong>Total Debris Detections:</strong> {video_results['total_detections']}</p>
-                        <p style='margin-bottom: 0.5rem;'>🎯 <strong>Frames with Debris:</strong> {video_results['debris_count']}</p>
-                        <p style='margin-bottom: 0.5rem;'>📈 <strong>Average Detections per Frame:</strong> {video_results['total_detections']/video_results['total_frames']:.2f}</p>
-                        <p style='margin-bottom: 0.5rem;'>📐 <strong>Resolution:</strong> {video_results['width']}x{video_results['height']}</p>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
+            # Display results
+            if video_results['total_detections'] > 0:  # Changed from debris_count to total_detections
+                st.success(f"Video processing complete! Detected approximately {video_results['debris_count']} unique debris objects across all frames.")
+                st.info(f"Total detection events: {video_results['total_detections']} (includes multiple detections of the same debris)")
             else:
-                st.error("Error: Video processing failed.")
-                
+                st.warning("No debris detected in the video.")
+            
+            # Try different methods to display the video
+            try:
+                # Method 1: Direct file path
+                st.video(video_results['output_path'])
+            except Exception as e1:
+                try:
+                    # Method 2: Read as bytes
+                    with open(video_results['output_path'], 'rb') as video_file:
+                        video_bytes = video_file.read()
+                        st.video(video_bytes)
+                except Exception as e2:
+                    try:
+                        # Method 3: Read as bytes with explicit format
+                        with open(video_results['output_path'], 'rb') as video_file:
+                            video_bytes = video_file.read()
+                            st.video(video_bytes, format='video/mp4')
+                    except Exception as e3:
+                        st.error("Unable to display the video. Please try a different video file.")
+                        st.error(f"Error details: {str(e3)}")
+            
+            # Display statistics
+            st.markdown(
+                f"""
+                <div class='result-box'>
+                    <h3 style='color: #E2A3FF; margin-bottom: 1rem;'>Analysis Results</h3>
+                    <p style='margin-bottom: 0.5rem;'>🎥 <strong>Video Length:</strong> {int(video_results['total_frames'] / video_results['fps'])} seconds</p>
+                    <p style='margin-bottom: 0.5rem;'>📊 <strong>Total Frames:</strong> {video_results['total_frames']}</p>
+                    <p style='margin-bottom: 0.5rem;'>🔍 <strong>Total Debris Detections:</strong> {video_results['total_detections']}</p>
+                    <p style='margin-bottom: 0.5rem;'>🎯 <strong>Frames with Debris:</strong> {video_results['debris_count']}</p>
+                    <p style='margin-bottom: 0.5rem;'>📈 <strong>Average Detections per Frame:</strong> {video_results['total_detections']/video_results['total_frames']:.2f}</p>
+                    <p style='margin-bottom: 0.5rem;'>📐 <strong>Resolution:</strong> {video_results['width']}x{video_results['height']}</p>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+            
+            # Display detection details if any were found
+            if video_results['detection_details']:
+                st.markdown("### Detection Details")
+                for det in video_results['detection_details']:
+                    st.markdown(f"- Frame {det['frame']}: Confidence {det['confidence']:.2f}")
+                    
         except Exception as e:
             st.error(f"Error processing video: {str(e)}")
             st.info("Please make sure the video format is supported and try again.")
-        
-        # Clean up temporary file
-        os.unlink(temp_file.name)
-    elif file_extension in ['jpg', 'jpeg', 'png']:
+    else:
         # Process image
         # Save uploaded file
         with open("uploaded_image.jpg", "wb") as f:
@@ -812,4 +803,3 @@ if uploaded_file is not None:
             st.info("🔍 No space debris detected in the image.")
         
         st.markdown('</div>', unsafe_allow_html=True)
-
