@@ -457,7 +457,7 @@ def process_video(video_path):
     # Create output paths
     output_path = os.path.join('temp_videos', 'output.mp4')
     
-    # Initialize progress bar
+    # Initialize progress bar and status text
     progress_bar = st.progress(0)
     status_text = st.empty()
     
@@ -568,7 +568,7 @@ def process_video(video_path):
         frame_count += 1
         progress = frame_count / total_frames
         progress_bar.progress(progress)
-        status_text.text(f"Processing frame {frame_count}/{total_frames}")
+        status_text.markdown(f"<p style='color: white; margin: 0; padding: 0;'>Processing frame {frame_count}/{total_frames}</p>", unsafe_allow_html=True)
     
     # Calculate estimated unique debris
     unique_debris = len(set(det['frame'] for det in detection_details))  # Count frames with detections
@@ -628,7 +628,7 @@ if uploaded_file is not None:
     
     if file_extension in ['mp4', 'avi']:
         # Process video
-        st.info("Processing video... This may take a few minutes depending on the video length.")
+        st.markdown("<p style='color: white;'>Processing video... This may take a few minutes depending on the video length.</p>", unsafe_allow_html=True)
         
         try:
             # Process the video
